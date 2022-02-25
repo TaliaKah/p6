@@ -1,6 +1,7 @@
 #include "Context.h"
 #include <glad/glad.h>
 #include <glm/gtx/matrix_transform_2d.hpp>
+#include <glm/gtx/vector_angle.hpp>
 #include <stdexcept>
 #include <string>
 #include "math.h"
@@ -10,6 +11,10 @@ namespace p6 {
 static Context& get_context(GLFWwindow* window)
 {
     return *reinterpret_cast<p6::Context*>(glfwGetWindowUserPointer(window)); // NOLINT
+}
+void framebuffer_size_callback(GLFWwindow* window, int width, int height)
+{
+    get_context(window).on_framebuffer_resize(width, height);
 }
 void window_size_callback(GLFWwindow* window, int width, int height)
 {
@@ -33,7 +38,7 @@ Context::Context(WindowCreationParams window_creation_params)
     , _window_size{window_creation_params.width,
                    window_creation_params.height}
     , _mouse_position{compute_mouse_position()}
-    , _default_render_target{{window_creation_params.width, window_creation_params.height}}
+    , _default_render_target{{1, 1}}
 {
     glpp::set_error_callback([&](std::string&& error_message) { // TODO glpp's error callback is global while on_error is tied to a context. This means that if we create two Contexts glpp will only use the error callback of the second Context.
         on_error(std::move(error_message));
@@ -44,9 +49,15 @@ Context::Context(WindowCreationParams window_creation_params)
 
     glfwSetWindowUserPointer(*_window, this);
     glfwSetWindowSizeCallback(*_window, &window_size_callback);
+    glfwSetFramebufferSizeCallback(*_window, &framebuffer_size_callback);
     glfwSetMouseButtonCallback(*_window, &mouse_button_callback);
     glfwSetScrollCallback(*_window, &scroll_callback);
     glfwSetKeyCallback(*_window, &key_callback);
+    { // Init _framebuffer_size
+        int width, height;
+        glfwGetFramebufferSize(*_window, &width, &height);
+        on_framebuffer_resize(width, height);
+    }
 
     render_to_screen();
 }
@@ -61,7 +72,7 @@ void Context::start()
                 update();
             }
             _default_render_target._render_target.blit_to(glpp::RenderTarget::screen_framebuffer_id(),
-                                                          _window_size,
+                                                          framebuffer_size(),
                                                           glpp::Interpolation::NearestNeighbour);
             render_to_screen();
             glfwSwapBuffers(*_window);
@@ -316,13 +327,15 @@ void Context::image(const Image& img, Transform2D transform)
 
 void Context::set_vertex_shader_uniforms(const Shader& shader, Transform2D transform) const
 {
-    shader.set("_inverse_aspect_ratio", 1.f / aspect_ratio());
+    shader.set("_window_aspect_ratio", aspect_ratio());
+    shader.set("_window_inverse_aspect_ratio", inverse_aspect_ratio());
     shader.set("_transform", glm::scale(glm::rotate(glm::translate(glm::mat3{1.f},
                                                                    transform.position),
                                                     transform.rotation.as_radians()),
                                         transform.scale));
-    shader.set("_rect_size", transform.scale);
-    shader.set("_rect_aspect_ratio", transform.scale.x / transform.scale.y);
+    shader.set("_size", transform.scale);
+    shader.set("_aspect_ratio", transform.scale.x / transform.scale.y);
+    shader.set("_inverse_aspect_ratio", transform.scale.y / transform.scale.x);
 }
 
 void Context::rectangle_with_shader(const Shader& shader, FullScreen)
@@ -382,9 +395,17 @@ void Context::square_with_shader(const Shader& shader, BottomRightCorner corner,
 
 void Context::rectangle_with_shader(const Shader& shader, Transform2D transform)
 {
-    shader.bind();
     set_vertex_shader_uniforms(shader, transform);
     _rect_renderer.render();
+}
+
+void Context::line(glm::vec2 start, glm::vec2 end)
+{
+    _line_shader.set("_material", stroke.as_premultiplied_vec4());
+    rectangle_with_shader(_line_shader,
+                          Center{(start + end) / 2.f},
+                          Radii{glm::distance(start, end) / 2.f, stroke_weight},
+                          Rotation{Radians{glm::orientedAngle(glm::vec2{1.f, 0.f}, glm::normalize(end - start))}});
 }
 
 void Context::render_with_rect_shader(Transform2D transform, bool is_ellipse, bool is_image) const
@@ -462,22 +483,27 @@ bool Context::alt() const
 
 float Context::aspect_ratio() const
 {
-    return static_cast<float>(_window_size.width()) / static_cast<float>(_window_size.height());
+    return static_cast<float>(framebuffer_width()) / static_cast<float>(framebuffer_height());
 }
 
-ImageSize Context::window_size() const
+float Context::inverse_aspect_ratio() const
 {
-    return _window_size;
+    return static_cast<float>(framebuffer_height()) / static_cast<float>(framebuffer_width());
 }
 
-int Context::window_width() const
+ImageSize Context::framebuffer_size() const
 {
-    return _window_size.width();
+    return _framebuffer_size;
 }
 
-int Context::window_height() const
+int Context::framebuffer_width() const
 {
-    return _window_size.height();
+    return framebuffer_size().width();
+}
+
+int Context::framebuffer_height() const
+{
+    return framebuffer_size().height();
 }
 
 bool Context::window_is_focused() const
@@ -576,8 +602,8 @@ bool Context::is_paused() const
 
 glm::vec2 Context::window_to_relative_coords(glm::vec2 pos) const
 {
-    const auto w = static_cast<float>(_window_size.width());
-    const auto h = static_cast<float>(_window_size.height());
+    const auto w = static_cast<float>(window_size().width());
+    const auto h = static_cast<float>(window_size().height());
 
     pos.y = h - pos.y;    // Make y-axis point up
     pos.x -= w / 2.f;     // Center around 0
@@ -585,12 +611,19 @@ glm::vec2 Context::window_to_relative_coords(glm::vec2 pos) const
     return pos / h * 2.f; // Normalize
 }
 
+void Context::on_framebuffer_resize(int width, int height)
+{
+    if (width > 0 && height > 0) {
+        _framebuffer_size = {width, height};
+        _default_render_target.resize(_framebuffer_size);
+        framebuffer_resized();
+    }
+}
+
 void Context::on_window_resize(int width, int height)
 {
     if (width > 0 && height > 0) {
         _window_size = {width, height};
-        _default_render_target.resize(_window_size);
-        window_resized();
     }
 }
 
